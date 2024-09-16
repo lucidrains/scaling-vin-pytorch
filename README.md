@@ -1,3 +1,5 @@
+<img src="./vin.png" width="400px"></img>
+
 ## Scaling Value Iteration Networks (wip)
 
 Exploration into the <a href="https://arxiv.org/abs/2406.08404">Scaling Value Iteration Networks</a> paper, from Schmidhuber's group
