@@ -16,3 +16,12 @@ Exploration into the <a href="https://arxiv.org/abs/2406.08404">Scaling Value It
     url     = {https://api.semanticscholar.org/CorpusID:270391752}
 }
 ```
+
+```bibtex
+@misc{pflueger2018soft,
+    title   = {Soft Value Iteration Networks for Planetary Rover Path Planning},
+    author  = {Max Pflueger and Ali Agha and Gaurav S. Sukhatme},
+    year    = {2018},
+    url     = {https://openreview.net/forum?id=Sktm4zWRb},
+}
+```
