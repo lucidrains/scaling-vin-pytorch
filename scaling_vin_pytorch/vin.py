@@ -182,3 +182,19 @@ class Planner(Module):
             layer_values.append(values)
 
         return values, layer_values
+
+# main class
+
+class ScalableVIN(Module):
+    def __init__(
+        self
+    ):
+        super().__init__()
+        raise NotImplementedError
+
+    def forward(
+        self,
+        values,
+        rewards
+    ):
+        raise NotImplementedError
