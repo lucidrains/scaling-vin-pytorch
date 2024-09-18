@@ -53,6 +53,7 @@ class ValueIteration(Module):
         receptive_field = 3,
         pad_value = 0.,
         logsumexp_pool = False,
+        logsumexp_temperature = 1.,
         softmax_transition_weight = True,
         dynamic_transition_kernel = True,
     ):
@@ -79,6 +80,7 @@ class ValueIteration(Module):
         # https://mpflueger.github.io/assets/pdf/svin_iclr2018_v2.pdf
 
         self.logsumexp_pool = logsumexp_pool
+        self.logsumexp_temperature = logsumexp_temperature
 
         self.dynamic_transition_kernel = dynamic_transition_kernel
         self.softmax_transition_weight = softmax_transition_weight
@@ -144,7 +146,8 @@ class ValueIteration(Module):
         if not self.logsumexp_pool:
             next_values = q_values.amax(dim = 1)
         else:
-            next_values = q_values.logsumexp(dim = 1)
+            temp = self.logsumexp_temperature
+            next_values = (q_values / temp).logsumexp(dim = 1) * temp
 
         return next_values
 
