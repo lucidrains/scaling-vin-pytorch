@@ -25,3 +25,13 @@ Exploration into the <a href="https://arxiv.org/abs/2406.08404">Scaling Value It
     url     = {https://openreview.net/forum?id=Sktm4zWRb},
 }
 ```
+
+```bibtex
+@inproceedings{Tamar2016ValueIN,
+    title   = {Value Iteration Networks},
+    author  = {Aviv Tamar and Sergey Levine and P. Abbeel and Yi Wu and Garrett Thomas},
+    booktitle = {Neural Information Processing Systems},
+    year    = {2016},
+    url     = {https://api.semanticscholar.org/CorpusID:11374605}
+}
+```
