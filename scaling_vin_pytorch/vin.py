@@ -1,3 +1,5 @@
+from functools import partial
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -67,7 +69,10 @@ class ValueIteration(Module):
         self.transition = nn.Conv2d(reward_and_value_dim, conv_out, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
+
         self.pad_value = pad_value
+        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+
         self.padding = padding
 
         # allow for logsumexp pooling
@@ -83,6 +88,8 @@ class ValueIteration(Module):
         values,
         rewards
     ):
+        pad = self.pad
+
         rewards_and_values, _ = pack([rewards, values], 'b * h w')
 
         # prepare for transition
@@ -93,7 +100,7 @@ class ValueIteration(Module):
 
         if self.dynamic_transition_kernel:
 
-            dynamic_transitions = F.conv2d(rewards_and_values, transition_weight, padding = self.padding)
+            dynamic_transitions = F.conv2d(pad(rewards_and_values), transition_weight)
 
             # reshape the output into the next transition weight kernel
 
@@ -109,7 +116,7 @@ class ValueIteration(Module):
 
             width = rewards_and_values.shape[-1] # for rearranging back after unfold
 
-            unfolded_values = F.unfold(rewards_and_values, self.kernel_size, padding = self.padding)
+            unfolded_values = F.unfold(pad(rewards_and_values), self.kernel_size)
             unfolded_values = rearrange(unfolded_values, 'b i (h w) -> b i h w', w = width)
 
             # dynamic kernel
@@ -130,7 +137,7 @@ class ValueIteration(Module):
 
             # transition
 
-            q_values = F.conv2d(rewards_and_values, transition_weight, padding = self.padding)
+            q_values = F.conv2d(pad(rewards_and_values), transition_weight)
 
         # selecting the next action
 
