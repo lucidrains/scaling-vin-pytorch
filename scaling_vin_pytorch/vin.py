@@ -1,7 +1,7 @@
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
@@ -186,8 +186,9 @@ class ScalableVIN(Module):
         reward_dim,
         num_actions,
         init_kernel_size = 7,
-        depth = 100,                # they scaled this to 5000 in the paper to solve 100x100 maze
-        loss_every_num_layers = 4,  # calculating loss every so many layers in the value iteration network
+        depth = 100,                    # they scaled this to 5000 in the paper to solve 100x100 maze
+        loss_every_num_layers = 4,      # calculating loss every so many layers in the value iteration network
+        final_cropout_kernel_size = 3,
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict()
     ):
@@ -211,7 +212,8 @@ class ScalableVIN(Module):
 
         # losses
 
-        self.to_action_logits = nn.Conv2d(1, num_actions, 3, padding = 1, bias = False)
+        self.final_cropout_kernel_size = final_cropout_kernel_size
+        self.to_action_logits = nn.Linear(final_cropout_kernel_size ** 2, num_actions, bias = False)
 
         self.loss_every_num_layers = loss_every_num_layers
 
@@ -236,23 +238,28 @@ class ScalableVIN(Module):
 
         if self.loss_every_num_layers < 1:
             # anything less than 1, just treat as only loss on last layer
-            layers_for_loss = layer_values[:1]
+            layer_values = layer_values[:1]
         else:
-            layers_for_loss = layer_values[::self.loss_every_num_layers]
+            layer_values = layer_values[::self.loss_every_num_layers]
+
+        layer_values, inverse_pack = pack_one(layer_values, '* c h w')  # pack the depth with the batch and calculate loss across all layers in one go
+
+        # unfold the values across all layers, and select out the coordinate for the agent position
+
+        unfolded_layer_values = F.unfold(layer_values, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
+
+        unfolded_layer_values = inverse_pack(unfolded_layer_values, '* a hw')
+
+        # get only the values at the agent coordinates
+
+        height_width_strides = tensor(state.stride()[-2:])
+        agent_position_hw_index = (agent_positions * height_width_strides).sum(dim = -1)
+
+        unfolded_layer_values = einx.get_at('d b a [hw], b -> d b a', unfolded_layer_values, agent_position_hw_index)
 
         # calculating action logits
 
-        layers_for_loss, inverse_pack = pack_one(layers_for_loss, '* c h w')  # pack the depth with the batch and calculate loss across all layers in one go
-
-        action_logits = self.to_action_logits(layers_for_loss)
-
-        action_logits = inverse_pack(action_logits)
-
-        # get only the actions at the agent coordinates
-
-        agent_pos_height, agent_pos_width = agent_positions.unbind(dim = -1)
-
-        action_logits = einx.get_at('d b a [h w], b, b -> d b a', action_logits, agent_pos_height, agent_pos_width)
+        action_logits = self.to_action_logits(unfolded_layer_values)
 
         # return logits if no labels
 
