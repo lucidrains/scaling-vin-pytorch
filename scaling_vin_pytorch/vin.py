@@ -1,9 +1,10 @@
-from functools import partial
+from functools import partial, wraps
 
 import torch
-from torch import nn, tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
+from torch import nn, tensor, Tensor, is_tensor
+from torch.utils.checkpoint import checkpoint_sequential
 
 from x_transformers import Attention
 
@@ -18,7 +19,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # i - input (channels)
 # h - height
 # w - width
-# d - depth of value iteration networ,
+# d - depth of value iteration network
 
 # helpers
 
@@ -43,6 +44,20 @@ def pack_one(t, pattern):
         return unpack(packed, packed_shape, override_pattern)[0]
 
     return output, inverse_fn
+
+def should_checkpoint(
+    self,
+    inputs: Tensor | tuple[Tensor, ...],
+    check_instance_variable = 'checkpoint'
+) -> bool:
+    if is_tensor(inputs):
+        inputs = (inputs,)
+
+    return (
+        self.training and
+        any([i.requires_grad for i in inputs]) and
+        (not exists(check_instance_variable) or getattr(self, check_instance_variable, False))
+    )
 
 # modules and classes
 
@@ -154,10 +169,15 @@ class ValueIterationNetwork(Module):
         self,
         vi_module: ValueIteration,
         depth,
+        checkpoint = True,
+        checkpoint_segments = None
     ):
         super().__init__()
-        self.vi_module = vi_module
         self.depth = depth
+        self.vi_module = vi_module
+
+        self.checkpoint = checkpoint
+        self.checkpoint_segments = checkpoint_segments
 
     def forward(
         self,
@@ -168,12 +188,38 @@ class ValueIterationNetwork(Module):
         values, _ = pack_one(values, 'b * h w')
         rewards, _ = pack_one(rewards, 'b * h w')
 
+        # output is values across all layers
+
         layer_values = []
 
-        for _ in range(self.depth):
-            values = self.vi_module(values, rewards)
+        # checkpointable or not
 
-            layer_values.append(values)
+        if should_checkpoint(self, (values, rewards)):
+
+            segments = default(self.checkpoint_segments, self.depth)
+            checkpoint_fn = partial(checkpoint_sequential, segments = segments, use_reentrant = False)
+
+            def recurrent_layer(inputs):
+                values, rewards, layer_values = inputs
+
+                next_values = self.vi_module(values, rewards)
+                next_layer_values = [*layer_values, next_values]
+
+                return next_values, rewards, next_layer_values
+
+            all_recurrent_layers = (recurrent_layer,) * self.depth
+
+            _, _, layer_values = checkpoint_fn(all_recurrent_layers, input = (values, rewards, layer_values))
+
+        else:
+
+            for _ in range(self.depth):
+                values = self.vi_module(values, rewards)
+                layer_values.append(values)
+
+        # return all values
+
+        assert len(layer_values) == self.depth
 
         return layer_values
 
