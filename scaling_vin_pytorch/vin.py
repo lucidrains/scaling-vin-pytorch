@@ -7,7 +7,8 @@ from torch.nn import Module, ModuleList
 
 from x_transformers import Attention
 
-from einops import rearrange, einsum, pack, unpack
+import einx
+from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
 # ein notation
 # b- batch
@@ -17,6 +18,7 @@ from einops import rearrange, einsum, pack, unpack
 # i - input (channels)
 # h - height
 # w - width
+# d - depth of value iteration networ,
 
 # helpers
 
@@ -47,9 +49,8 @@ def pack_one(t, pattern):
 class ValueIteration(Module):
     def __init__(
         self,
-        *,
-        reward_dim,
         action_channels,
+        *,
         receptive_field = 3,
         pad_value = 0.,
         logsumexp_pool = False,
@@ -61,13 +62,10 @@ class ValueIteration(Module):
         assert is_odd(receptive_field)
         padding = receptive_field // 2
 
-        self.reward_dim = reward_dim
         self.action_channels = action_channels
 
-        reward_and_value_dim = reward_dim + 1
-
-        conv_out = action_channels * (1 if not dynamic_transition_kernel else reward_and_value_dim * receptive_field ** 2)
-        self.transition = nn.Conv2d(reward_and_value_dim, conv_out, receptive_field, padding = padding, bias = False)
+        conv_out = action_channels * (1 if not dynamic_transition_kernel else receptive_field ** 2)
+        self.transition = nn.Conv2d(1, conv_out, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
 
@@ -92,7 +90,7 @@ class ValueIteration(Module):
     ):
         pad = self.pad
 
-        rewards_and_values, _ = pack([rewards, values], 'b * h w')
+        rewards_and_values = values + rewards
 
         # prepare for transition
 
@@ -144,27 +142,22 @@ class ValueIteration(Module):
         # selecting the next action
 
         if not self.logsumexp_pool:
-            next_values = q_values.amax(dim = 1)
+            next_values = q_values.amax(dim = 1, keepdim = True)
         else:
             temp = self.logsumexp_temperature
-            next_values = (q_values / temp).logsumexp(dim = 1) * temp
+            next_values = (q_values / temp).logsumexp(dim = 1, keepdim = True) * temp
 
         return next_values
 
-class Planner(Module):
+class ValueIterationNetwork(Module):
     def __init__(
         self,
         vi_module: ValueIteration,
-        reward_dim,
-        recurrent_steps,
-        reward_kernel_size = 3
+        depth,
     ):
         super().__init__()
         self.vi_module = vi_module
-        assert vi_module.reward_dim == reward_dim
-
-        self.encode_rewards = nn.Conv2d(reward_dim, reward_dim, reward_kernel_size, padding = reward_kernel_size // 2, bias = False)
-        self.recurrent_steps = recurrent_steps
+        self.depth = depth
 
     def forward(
         self,
@@ -175,29 +168,107 @@ class Planner(Module):
         values, _ = pack_one(values, 'b * h w')
         rewards, _ = pack_one(rewards, 'b * h w')
 
-        rewards = self.encode_rewards(rewards)
-
         layer_values = []
 
-        for _ in range(self.recurrent_steps):
+        for _ in range(self.depth):
             values = self.vi_module(values, rewards)
 
             layer_values.append(values)
 
-        return values, layer_values
+        return layer_values
 
 # main class
 
 class ScalableVIN(Module):
     def __init__(
-        self
+        self,
+        state_dim,
+        reward_dim,
+        num_actions,
+        init_kernel_size = 7,
+        depth = 100,                # they scaled this to 5000 in the paper to solve 100x100 maze
+        loss_every_num_layers = 4,  # calculating loss every so many layers in the value iteration network
+        vi_module_kwargs: dict = dict(),
+        vin_kwargs: dict = dict()
     ):
         super().__init__()
-        raise NotImplementedError
+
+        self.state_to_values = nn.Conv2d(state_dim, 1, init_kernel_size, padding = init_kernel_size // 2, bias = False)
+        self.reward_mapper = nn.Conv2d(reward_dim, 1, init_kernel_size, padding = init_kernel_size // 2, bias = False)
+
+        # value iteration network
+
+        value_iteration_module = ValueIteration(
+            num_actions,
+            **vi_module_kwargs
+        )
+
+        self.planner = ValueIterationNetwork(
+            value_iteration_module,
+            depth = depth,
+            **vin_kwargs
+        )
+
+        # losses
+
+        self.to_action_logits = nn.Conv2d(1, num_actions, 3, padding = 1, bias = False)
+
+        self.loss_every_num_layers = loss_every_num_layers
 
     def forward(
         self,
-        values,
-        rewards
+        state,
+        reward,
+        agent_positions,
+        target_actions = None
     ):
-        raise NotImplementedError
+        value = self.state_to_values(state)
+        reward = self.reward_mapper(reward)
+
+        layer_values = self.planner(value, reward)
+
+        # values across all layers
+
+        layer_values = torch.stack(layer_values)
+        layer_values = torch.flip(layer_values, dims = (0,)) # so depth goes from last layer to first
+
+        # gather all layers for calculating losses
+
+        if self.loss_every_num_layers < 1:
+            # anything less than 1, just treat as only loss on last layer
+            layers_for_loss = layer_values[:1]
+        else:
+            layers_for_loss = layer_values[::self.loss_every_num_layers]
+
+        # calculating action logits
+
+        layers_for_loss, inverse_pack = pack_one(layers_for_loss, '* c h w')  # pack the depth with the batch and calculate loss across all layers in one go
+
+        action_logits = self.to_action_logits(layers_for_loss)
+
+        action_logits = inverse_pack(action_logits)
+
+        # get only the actions at the agent coordinates
+
+        agent_pos_height, agent_pos_width = agent_positions.unbind(dim = -1)
+
+        action_logits = einx.get_at('d b a [h w], b, b -> d b a', action_logits, agent_pos_height, agent_pos_width)
+
+        # return logits if no labels
+
+        if not exists(target_actions):
+            return action_logits
+
+        num_layers_calc_loss = action_logits.shape[0]
+
+        # else calculate the loss
+
+        losses = F.cross_entropy(
+            rearrange(action_logits, 'd b a -> b a d'),
+            repeat(target_actions, 'b -> b d', d = num_layers_calc_loss),
+            reduction = 'none'
+        )
+
+        losses = reduce(losses, 'b d -> b', 'sum') # sum losses across depth, could do some sort of weighting too
+
+        return losses.mean()

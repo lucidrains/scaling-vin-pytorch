@@ -4,6 +4,41 @@
 
 Exploration into the <a href="https://arxiv.org/abs/2406.08404">Scaling Value Iteration Networks</a> paper, from Schmidhuber's group
 
+## Usage
+
+```python
+import torch
+from scaling_vin_pytorch import ScalableVIN
+
+scalable_vin = ScalableVIN(
+    state_dim = 3,
+    reward_dim = 2,
+    num_actions = 10
+)
+
+state = torch.randn(2, 3, 32, 32)
+reward = torch.randn(2, 2, 32, 32)
+
+agent_positions = torch.randint(0, 32, (2, 2))
+
+target_actions = torch.randint(0, 10, (2,))
+
+loss = scalable_vin(
+    state,
+    reward,
+    agent_positions,
+    target_actions
+)
+
+loss.backward()
+
+action_logits = scalable_vin(
+    state,
+    reward,
+    agent_positions
+)
+```
+
 ## Citations
 
 ```bibtex
