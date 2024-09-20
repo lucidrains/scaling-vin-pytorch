@@ -184,15 +184,16 @@ class ValueIterationNetwork(Module):
         values,
         rewards,
     ):
+        depth = self.depth
 
         values, _ = pack_one(values, 'b * h w')
         rewards, _ = pack_one(rewards, 'b * h w')
 
         # checkpointable or not
 
-        if should_checkpoint(self, (values, rewards)):
+        if depth > 1 and should_checkpoint(self, (values, rewards)):
 
-            layer_values = [None] * self.depth
+            layer_values = [None] * depth
 
             segments = default(self.checkpoint_segments, self.depth)
             checkpoint_fn = partial(checkpoint_sequential, segments = segments, use_reentrant = False)
@@ -214,13 +215,13 @@ class ValueIterationNetwork(Module):
 
             layer_values = []
 
-            for _ in range(self.depth):
+            for _ in range(depth):
                 values = self.vi_module(values, rewards)
                 layer_values.append(values)
 
         # return all values
 
-        assert len(layer_values) == self.depth
+        assert len(layer_values) == depth
 
         return layer_values
 
@@ -232,6 +233,7 @@ class ScalableVIN(Module):
         state_dim,
         reward_dim,
         num_actions,
+        dim_hidden = 150,
         init_kernel_size = 7,
         depth = 100,                    # they scaled this to 5000 in the paper to solve 100x100 maze
         loss_every_num_layers = 4,      # calculating loss every so many layers in the value iteration network
@@ -241,8 +243,12 @@ class ScalableVIN(Module):
     ):
         super().__init__()
 
-        self.state_to_values = nn.Conv2d(state_dim, 1, init_kernel_size, padding = init_kernel_size // 2, bias = False)
-        self.reward_mapper = nn.Conv2d(reward_dim, 1, init_kernel_size, padding = init_kernel_size // 2, bias = False)
+        self.reward_mapper = nn.Sequential(
+            nn.Conv2d(state_dim + reward_dim, dim_hidden, 3, padding = 1),
+            nn.Conv2d(dim_hidden, 1, 1, bias = False)
+        )
+
+        self.to_init_value = nn.Conv2d(1, num_actions, 3, padding = 1, bias = False)
 
         # value iteration network
 
@@ -271,8 +277,13 @@ class ScalableVIN(Module):
         agent_positions,
         target_actions = None
     ):
-        value = self.state_to_values(state)
-        reward = self.reward_mapper(reward)
+        state_reward, _ = pack([state, reward], 'b * h w')
+
+        reward = self.reward_mapper(state_reward)
+
+        q_values = self.to_init_value(reward)
+
+        value = q_values.amax(dim = 1, keepdim = True)
 
         layer_values = self.planner(value, reward)
 
