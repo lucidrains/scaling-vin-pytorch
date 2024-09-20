@@ -7,6 +7,7 @@ from torch import nn, tensor, Tensor, is_tensor
 from torch.utils.checkpoint import checkpoint_sequential
 
 from x_transformers import Attention
+from x_transformers.x_transformers import RotaryEmbedding
 
 import einx
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
@@ -240,7 +241,9 @@ class ScalableVIN(Module):
         loss_every_num_layers = 4,      # calculating loss every so many layers in the value iteration network
         final_cropout_kernel_size = 3,
         vi_module_kwargs: dict = dict(),
-        vin_kwargs: dict = dict()
+        vin_kwargs: dict = dict(),
+        attn_dim_head = 64,
+        attn_kwargs: dict = dict()
     ):
         super().__init__()
         self.depth = depth
@@ -275,14 +278,22 @@ class ScalableVIN(Module):
         self.attn_pool = Attention(
             dim = final_value_dim + final_state_dim,
             dim_out = final_value_dim,
-            causal = True
+            causal = True,
+            dim_head = attn_dim_head,
+            **attn_kwargs
         )
+
+        self.rotary_pos_emb = RotaryEmbedding(attn_dim_head)
 
         # losses
 
         self.to_action_logits = nn.Linear(final_value_dim, num_actions, bias = False)
 
         self.loss_every_num_layers = loss_every_num_layers
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def forward(
         self,
@@ -330,7 +341,9 @@ class ScalableVIN(Module):
 
         state_and_all_values, _ = pack([unfolded_layer_values, unfolded_state_values], 'b d *')
 
-        attended = self.attn_pool(state_and_all_values)
+        rotary_pos_emb = self.rotary_pos_emb(torch.arange(self.depth, device = self.device))
+
+        attended = self.attn_pool(state_and_all_values, rotary_pos_emb = rotary_pos_emb)
 
         # add the output of the 'causal' attention (across depth) to the values
 
