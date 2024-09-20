@@ -121,8 +121,10 @@ class ValueIteration(Module):
 
         self.action_channels = action_channels
         plan_actions = num_plans * action_channels
+        self.num_plans = num_plans
 
-        conv_out = plan_actions * (1 if not dynamic_transition_kernel else receptive_field ** 2)
+        conv_out = action_channels * (num_plans ** 2) * (1 if not dynamic_transition_kernel else receptive_field ** 2)
+
         self.transition = nn.Conv2d(num_plans, conv_out, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
@@ -161,7 +163,7 @@ class ValueIteration(Module):
 
             # reshape the output into the next transition weight kernel
 
-            dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, o = self.action_channels)
+            dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, i = self.num_plans)
 
             # the author then uses a softmax on the dynamic transition kernel
             # this actually becomes form of attention pooling seen in other papers
