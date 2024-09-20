@@ -61,6 +61,19 @@ def should_checkpoint(
         (not exists(check_instance_variable) or getattr(self, check_instance_variable, False))
     )
 
+# tensor helpers
+
+def soft_maxpool(
+    t,
+    temperature = 1.,
+    dim = 1,
+    keepdim = True
+):
+    t = t / temperature
+    out = t.softmax(dim = dim) * t
+    out = out.sum(dim = dim, keepdim = keepdim)
+    return out * temperature
+
 # modules and classes
 
 class ValueIteration(Module):
@@ -70,8 +83,8 @@ class ValueIteration(Module):
         *,
         receptive_field = 3,
         pad_value = 0.,
-        logsumexp_pool = False,
-        logsumexp_temperature = 1.,
+        soft_maxpool = False,
+        soft_maxpool_temperature = 1.,
         softmax_transition_weight = True,
         dynamic_transition_kernel = True,
     ):
@@ -91,11 +104,11 @@ class ValueIteration(Module):
 
         self.padding = padding
 
-        # allow for logsumexp pooling
+        # allow for softmax(x) * x pooling
         # https://mpflueger.github.io/assets/pdf/svin_iclr2018_v2.pdf
 
-        self.logsumexp_pool = logsumexp_pool
-        self.logsumexp_temperature = logsumexp_temperature
+        self.soft_maxpool = soft_maxpool
+        self.soft_maxpool_temperature = soft_maxpool_temperature
 
         self.dynamic_transition_kernel = dynamic_transition_kernel
         self.softmax_transition_weight = softmax_transition_weight
@@ -158,11 +171,10 @@ class ValueIteration(Module):
 
         # selecting the next action
 
-        if not self.logsumexp_pool:
+        if not self.soft_maxpool:
             next_values = q_values.amax(dim = 1, keepdim = True)
         else:
-            temp = self.logsumexp_temperature
-            next_values = (q_values / temp).logsumexp(dim = 1, keepdim = True) * temp
+            next_values = soft_maxpool(q_values,  temperature = self.soft_maxpool_temperature)
 
         return next_values
 
@@ -240,6 +252,8 @@ class ScalableVIN(Module):
         depth = 100,                    # they scaled this to 5000 in the paper to solve 100x100 maze
         loss_every_num_layers = 4,      # calculating loss every so many layers in the value iteration network
         final_cropout_kernel_size = 3,
+        soft_maxpool = False,
+        soft_maxpool_temperature = 1.,
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict(),
         attn_dim_head = 64,
@@ -254,11 +268,15 @@ class ScalableVIN(Module):
         )
 
         self.to_init_value = nn.Conv2d(1, num_actions, 3, padding = 1, bias = False)
+        self.soft_maxpool = soft_maxpool
+        self.soft_maxpool_temperature = soft_maxpool_temperature
 
         # value iteration network
 
         value_iteration_module = ValueIteration(
             num_actions,
+            soft_maxpool = soft_maxpool,
+            soft_maxpool_temperature = soft_maxpool_temperature,
             **vi_module_kwargs
         )
 
@@ -308,7 +326,10 @@ class ScalableVIN(Module):
 
         q_values = self.to_init_value(reward)
 
-        value = q_values.amax(dim = 1, keepdim = True)
+        if self.soft_maxpool:
+            value = soft_maxpool(q_values, temperature = self.soft_maxpool_temperature)
+        else:
+            value = q_values.amax(dim = 1, keepdim = True)
 
         layer_values = self.planner(value, reward)
 
