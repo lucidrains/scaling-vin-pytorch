@@ -197,8 +197,9 @@ class ValueIterationNetwork(Module):
         self,
         values,
         rewards,
+        depth = None
     ):
-        depth = self.depth
+        depth = default(depth, self.depth)
 
         values, _ = pack_one(values, 'b * h w')
         rewards, _ = pack_one(rewards, 'b * h w')
@@ -209,7 +210,7 @@ class ValueIterationNetwork(Module):
 
             layer_values = [None] * depth
 
-            segments = default(self.checkpoint_segments, self.depth)
+            segments = default(self.checkpoint_segments, depth)
             checkpoint_fn = partial(checkpoint_sequential, segments = segments, use_reentrant = False)
 
             def recurrent_layer(inputs):
@@ -221,7 +222,7 @@ class ValueIterationNetwork(Module):
 
                 return layer_ind + 1, next_values, rewards, *layer_values
 
-            all_recurrent_layers = (recurrent_layer,) * self.depth
+            all_recurrent_layers = (recurrent_layer,) * depth
 
             _, _, _, *layer_values = checkpoint_fn(all_recurrent_layers, input = (0, values, rewards, *layer_values))
 
@@ -318,8 +319,11 @@ class ScalableVIN(Module):
         state,
         reward,
         agent_positions,
-        target_actions = None
+        target_actions = None,
+        depth = None
     ):
+        depth = default(depth, self.depth)
+
         state_reward, _ = pack([state, reward], 'b * h w')
 
         reward = self.reward_mapper(state_reward)
@@ -331,7 +335,7 @@ class ScalableVIN(Module):
         else:
             value = q_values.amax(dim = 1, keepdim = True)
 
-        layer_values = self.planner(value, reward)
+        layer_values = self.planner(value, reward, depth = depth)
 
         # values across all layers
 
@@ -358,11 +362,11 @@ class ScalableVIN(Module):
         unfolded_state_values = F.unfold(state, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
         unfolded_state_values = einx.get_at('b s [hw], b -> b s', unfolded_state_values, agent_position_hw_index)
 
-        unfolded_state_values = repeat(unfolded_state_values, 'b s -> b d s', d = self.depth)
+        unfolded_state_values = repeat(unfolded_state_values, 'b s -> b d s', d = depth)
 
         state_and_all_values, _ = pack([unfolded_layer_values, unfolded_state_values], 'b d *')
 
-        rotary_pos_emb = self.rotary_pos_emb(torch.arange(self.depth, device = self.device))
+        rotary_pos_emb = self.rotary_pos_emb(torch.arange(depth, device = self.device))
 
         attended = self.attn_pool(state_and_all_values, rotary_pos_emb = rotary_pos_emb)
 

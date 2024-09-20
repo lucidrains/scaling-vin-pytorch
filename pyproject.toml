@@ -1,6 +1,6 @@
 [project]
 name = "scaling-vin-pytorch"
-version = "0.0.2"
+version = "0.0.3"
 description = "Scaling Value Iteration Networks"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
