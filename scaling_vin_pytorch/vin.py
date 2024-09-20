@@ -16,6 +16,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # b - batch
 # c - channels
 # s - state dimension
+# v - values
 # a - actions (channels)
 # o - output (channels)
 # i - input (channels)
@@ -275,6 +276,8 @@ class ScalableVIN(Module):
         super().__init__()
         self.depth = depth
         self.num_actions = num_actions
+        self.num_plans = num_plans
+
         plan_actions = num_actions * num_plans
 
         self.reward_mapper = nn.Sequential(
@@ -308,7 +311,7 @@ class ScalableVIN(Module):
 
         self.final_cropout_kernel_size = final_cropout_kernel_size
 
-        final_value_dim = num_plans * final_cropout_kernel_size ** 2
+        final_value_dim = final_cropout_kernel_size ** 2
         final_state_dim = state_dim * final_cropout_kernel_size ** 2
 
         # final attention across all values
@@ -325,7 +328,7 @@ class ScalableVIN(Module):
 
         # losses
 
-        self.to_action_logits = nn.Linear(final_value_dim, num_actions, bias = False)
+        self.to_action_logits = nn.Linear(num_plans * final_value_dim, num_actions, bias = False)
 
         self.loss_every_num_layers = loss_every_num_layers
 
@@ -341,6 +344,8 @@ class ScalableVIN(Module):
         target_actions = None,
         depth = None
     ):
+        batch, num_plans = state.shape[0], self.num_plans
+
         depth = default(depth, self.depth)
 
         state_reward, _ = pack([state, reward], 'b * h w')
@@ -371,16 +376,21 @@ class ScalableVIN(Module):
         height_width_strides = tensor(state.stride()[-2:])
         agent_position_hw_index = (agent_positions * height_width_strides).sum(dim = -1)
 
-        unfolded_layer_values = einx.get_at('d b a [hw], b -> b d a', unfolded_layer_values, agent_position_hw_index)
+        unfolded_layer_values = einx.get_at('d b v [hw], b -> b d v', unfolded_layer_values, agent_position_hw_index)
+
+        unfolded_layer_values = rearrange(unfolded_layer_values, 'b d (p v) -> (b p) d v', p = num_plans)
 
         # concat states onto each value and do an attention across all values across all layers
 
         unfolded_state_values = F.unfold(state, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
         unfolded_state_values = einx.get_at('b s [hw], b -> b s', unfolded_state_values, agent_position_hw_index)
 
-        unfolded_state_values = repeat(unfolded_state_values, 'b s -> b d s', d = depth)
+        unfolded_state_values = repeat(unfolded_state_values, 'b s -> (b p) d s', d = depth, p = num_plans)
 
         state_and_all_values, _ = pack([unfolded_layer_values, unfolded_state_values], 'b d *')
+
+        # allow each layer values to attend to all layers of the past
+        # if there are multiple plans, layer values of each plan will have its own attention map
 
         rotary_pos_emb = self.rotary_pos_emb(torch.arange(depth, device = self.device))
 
@@ -389,6 +399,10 @@ class ScalableVIN(Module):
         # add the output of the 'causal' attention (across depth) to the values
 
         unfolded_layer_values = unfolded_layer_values + attended
+
+        # fold num plans dimension back into action dimension
+
+        unfolded_layer_values = rearrange(unfolded_layer_values, '(b p) d v -> b d (p v)', p = num_plans)
 
         # gather all layers for calculating losses
 
