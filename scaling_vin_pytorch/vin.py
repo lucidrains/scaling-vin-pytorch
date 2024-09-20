@@ -123,7 +123,7 @@ class ValueIteration(Module):
         plan_actions = num_plans * action_channels
         self.num_plans = num_plans
 
-        conv_out = action_channels * (num_plans ** 2) * (1 if not dynamic_transition_kernel else receptive_field ** 2)
+        conv_out = action_channels * num_plans * (1 if not dynamic_transition_kernel else (num_plans * receptive_field ** 2))
 
         self.transition = nn.Conv2d(num_plans, conv_out, receptive_field, padding = padding, bias = False)
 
@@ -270,6 +270,7 @@ class ScalableVIN(Module):
         final_cropout_kernel_size = 3,
         soft_maxpool = False,
         soft_maxpool_temperature = 1.,
+        dynamic_transition_kernel = True,
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict(),
         attn_dim_head = 64,
@@ -302,6 +303,7 @@ class ScalableVIN(Module):
             num_plans = num_plans,
             soft_maxpool = soft_maxpool,
             soft_maxpool_temperature = soft_maxpool_temperature,
+            dynamic_transition_kernel = dynamic_transition_kernel,
             **vi_module_kwargs
         )
 
@@ -408,7 +410,9 @@ class ScalableVIN(Module):
 
         # gather all layers for calculating losses
 
-        if self.loss_every_num_layers < 1:
+        only_last_layer = self.loss_every_num_layers < 1
+
+        if only_last_layer:
             # anything less than 1, just treat as only loss on last layer
             unfolded_layer_values = unfolded_layer_values[:, :1]
         else:
