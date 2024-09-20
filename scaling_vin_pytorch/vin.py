@@ -14,6 +14,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # ein notation
 # b- batch
 # c - channels
+# s - state dimension
 # a - actions (channels)
 # o - output (channels)
 # i - input (channels)
@@ -242,6 +243,7 @@ class ScalableVIN(Module):
         vin_kwargs: dict = dict()
     ):
         super().__init__()
+        self.depth = depth
 
         self.reward_mapper = nn.Sequential(
             nn.Conv2d(state_dim + reward_dim, dim_hidden, 3, padding = 1),
@@ -263,10 +265,22 @@ class ScalableVIN(Module):
             **vin_kwargs
         )
 
+        self.final_cropout_kernel_size = final_cropout_kernel_size
+
+        final_value_dim = final_cropout_kernel_size ** 2
+        final_state_dim = state_dim * final_cropout_kernel_size ** 2
+
+        # final attention across all values
+
+        self.attn_pool = Attention(
+            dim = final_value_dim + final_state_dim,
+            dim_out = final_value_dim,
+            causal = True
+        )
+
         # losses
 
-        self.final_cropout_kernel_size = final_cropout_kernel_size
-        self.to_action_logits = nn.Linear(final_cropout_kernel_size ** 2, num_actions, bias = False)
+        self.to_action_logits = nn.Linear(final_value_dim, num_actions, bias = False)
 
         self.loss_every_num_layers = loss_every_num_layers
 
@@ -292,14 +306,6 @@ class ScalableVIN(Module):
         layer_values = torch.stack(layer_values)
         layer_values = torch.flip(layer_values, dims = (0,)) # so depth goes from last layer to first
 
-        # gather all layers for calculating losses
-
-        if self.loss_every_num_layers < 1:
-            # anything less than 1, just treat as only loss on last layer
-            layer_values = layer_values[:1]
-        else:
-            layer_values = layer_values[::self.loss_every_num_layers]
-
         layer_values, inverse_pack = pack_one(layer_values, '* c h w')  # pack the depth with the batch and calculate loss across all layers in one go
 
         # unfold the values across all layers, and select out the coordinate for the agent position
@@ -313,7 +319,32 @@ class ScalableVIN(Module):
         height_width_strides = tensor(state.stride()[-2:])
         agent_position_hw_index = (agent_positions * height_width_strides).sum(dim = -1)
 
-        unfolded_layer_values = einx.get_at('d b a [hw], b -> d b a', unfolded_layer_values, agent_position_hw_index)
+        unfolded_layer_values = einx.get_at('d b a [hw], b -> b d a', unfolded_layer_values, agent_position_hw_index)
+
+        # concat states onto each value and do an attention across all values across all layers
+
+        unfolded_state_values = F.unfold(state, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
+        unfolded_state_values = einx.get_at('b s [hw], b -> b s', unfolded_state_values, agent_position_hw_index)
+
+        unfolded_state_values = repeat(unfolded_state_values, 'b s -> b d s', d = self.depth)
+
+        state_and_all_values, _ = pack([unfolded_layer_values, unfolded_state_values], 'b d *')
+
+        attended = self.attn_pool(state_and_all_values)
+
+        # add the output of the 'causal' attention (across depth) to the values
+
+        unfolded_layer_values = unfolded_layer_values + attended
+
+        # gather all layers for calculating losses
+
+        if self.loss_every_num_layers < 1:
+            # anything less than 1, just treat as only loss on last layer
+            unfolded_layer_values = unfolded_layer_values[:, :1]
+        else:
+            unfolded_layer_values = unfolded_layer_values[:, ::self.loss_every_num_layers]
+
+        num_layers_calc_loss = unfolded_layer_values.shape[1]
 
         # calculating action logits
 
@@ -324,12 +355,10 @@ class ScalableVIN(Module):
         if not exists(target_actions):
             return action_logits
 
-        num_layers_calc_loss = action_logits.shape[0]
-
         # else calculate the loss
 
         losses = F.cross_entropy(
-            rearrange(action_logits, 'd b a -> b a d'),
+            rearrange(action_logits, 'b d a -> b a d'),
             repeat(target_actions, 'b -> b d', d = num_layers_calc_loss),
             reduction = 'none'
         )
