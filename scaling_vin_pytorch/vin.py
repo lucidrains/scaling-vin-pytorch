@@ -188,30 +188,31 @@ class ValueIterationNetwork(Module):
         values, _ = pack_one(values, 'b * h w')
         rewards, _ = pack_one(rewards, 'b * h w')
 
-        # output is values across all layers
-
-        layer_values = []
-
         # checkpointable or not
 
         if should_checkpoint(self, (values, rewards)):
+
+            layer_values = [None] * self.depth
 
             segments = default(self.checkpoint_segments, self.depth)
             checkpoint_fn = partial(checkpoint_sequential, segments = segments, use_reentrant = False)
 
             def recurrent_layer(inputs):
-                values, rewards, layer_values = inputs
+                layer_ind, values, rewards, *layer_values = inputs
 
                 next_values = self.vi_module(values, rewards)
-                next_layer_values = [*layer_values, next_values]
 
-                return next_values, rewards, next_layer_values
+                layer_values[layer_ind] = next_values
+
+                return layer_ind + 1, next_values, rewards, *layer_values
 
             all_recurrent_layers = (recurrent_layer,) * self.depth
 
-            _, _, layer_values = checkpoint_fn(all_recurrent_layers, input = (values, rewards, layer_values))
+            _, _, _, *layer_values = checkpoint_fn(all_recurrent_layers, input = (0, values, rewards, *layer_values))
 
         else:
+
+            layer_values = []
 
             for _ in range(self.depth):
                 values = self.vi_module(values, rewards)
