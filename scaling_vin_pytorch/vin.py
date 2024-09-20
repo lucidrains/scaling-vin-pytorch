@@ -85,7 +85,6 @@ class ValueIteration(Module):
         pad_value = 0.,
         soft_maxpool = False,
         soft_maxpool_temperature = 1.,
-        softmax_transition_weight = True,
         dynamic_transition_kernel = True,
     ):
         super().__init__()
@@ -111,7 +110,6 @@ class ValueIteration(Module):
         self.soft_maxpool_temperature = soft_maxpool_temperature
 
         self.dynamic_transition_kernel = dynamic_transition_kernel
-        self.softmax_transition_weight = softmax_transition_weight
 
     def forward(
         self,
@@ -136,11 +134,10 @@ class ValueIteration(Module):
 
             dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, o = self.action_channels)
 
-            if self.softmax_transition_weight:
-                # oh, the softmax latent transition was applied to the dynamic output, makes sense
-                # but it should be compared to the original formulation
+            # the author then uses a softmax on the dynamic transition kernel
+            # this actually becomes form of attention pooling seen in other papers
 
-                dynamic_transitions = F.softmax(dynamic_transitions, dim = -1)
+            dynamic_transitions = F.softmax(dynamic_transitions, dim = -1)
 
             # unfold the reward and values to manually do "conv" with data dependent kernel
 
@@ -154,17 +151,6 @@ class ValueIteration(Module):
             q_values = einsum(unfolded_values, dynamic_transitions, 'b i h w, b o h w i -> b o h w')
 
         else:
-
-            # in this paper, they propose a softmax latent transition kernel to stabilize to high depths
-            # seems like the loss of expressivity is made up for by depth
-
-            if self.softmax_transition_weight:
-
-                transition_weight, inverse_fn = pack_one(transition_weight, 'o *')
-                transition_weight = transition_weight.softmax(dim = -1)
-
-                transition_weight = inverse_fn(transition_weight) # (o *) -> (o i h w)
-
             # transition
 
             q_values = F.conv2d(pad(rewards_and_values), transition_weight)
