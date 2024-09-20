@@ -1,1 +1,6 @@
-from scaling_vin_pytorch.vin import ScalableVIN
+from scaling_vin_pytorch.vin import (
+    ScalableVIN,
+    ActionSelector,
+    ValueIteration,
+    ValueIterationNetwork
+)
