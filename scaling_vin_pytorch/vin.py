@@ -13,7 +13,7 @@ import einx
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
 # ein notation
-# b- batch
+# b - batch
 # c - channels
 # s - state dimension
 # a - actions (channels)
@@ -22,6 +22,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # h - height
 # w - width
 # d - depth of value iteration network
+# p - number of plans (different value maps transitioned on)
 
 # helpers
 
@@ -67,20 +68,46 @@ def soft_maxpool(
     t,
     temperature = 1.,
     dim = 1,
-    keepdim = True
 ):
     t = t / temperature
     out = t.softmax(dim = dim) * t
-    out = out.sum(dim = dim, keepdim = keepdim)
+    out = out.sum(dim = dim)
     return out * temperature
 
 # modules and classes
+
+class ActionSelector(Module):
+    def __init__(
+        self,
+        num_plans = 1,
+        soft_maxpool = False,
+        soft_maxpool_temperature = 1,
+    ):
+        super().__init__()
+        self.num_plans = num_plans
+
+        # allow for softmax(x) * x pooling
+        # https://mpflueger.github.io/assets/pdf/svin_iclr2018_v2.pdf
+        self.soft_maxpool = soft_maxpool
+        self.soft_maxpool_temperature = soft_maxpool_temperature
+
+    def forward(self, q_values):
+
+        q_values = rearrange(q_values, 'b (p a) ... -> b p a ...', p = self.num_plans)
+
+        if not self.soft_maxpool:
+            next_values = q_values.amax(dim = 2)
+        else:
+            next_values = soft_maxpool(q_values, temperature = self.soft_maxpool_temperature, dim = 2)
+
+        return next_values
 
 class ValueIteration(Module):
     def __init__(
         self,
         action_channels,
         *,
+        num_plans = 1,
         receptive_field = 3,
         pad_value = 0.,
         soft_maxpool = False,
@@ -92,9 +119,10 @@ class ValueIteration(Module):
         padding = receptive_field // 2
 
         self.action_channels = action_channels
+        plan_actions = num_plans * action_channels
 
-        conv_out = action_channels * (1 if not dynamic_transition_kernel else receptive_field ** 2)
-        self.transition = nn.Conv2d(1, conv_out, receptive_field, padding = padding, bias = False)
+        conv_out = plan_actions * (1 if not dynamic_transition_kernel else receptive_field ** 2)
+        self.transition = nn.Conv2d(num_plans, conv_out, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
 
@@ -103,11 +131,11 @@ class ValueIteration(Module):
 
         self.padding = padding
 
-        # allow for softmax(x) * x pooling
-        # https://mpflueger.github.io/assets/pdf/svin_iclr2018_v2.pdf
-
-        self.soft_maxpool = soft_maxpool
-        self.soft_maxpool_temperature = soft_maxpool_temperature
+        self.action_selector = ActionSelector(
+            num_plans = num_plans,
+            soft_maxpool = soft_maxpool,
+            soft_maxpool_temperature = soft_maxpool_temperature
+        )
 
         self.dynamic_transition_kernel = dynamic_transition_kernel
 
@@ -157,10 +185,7 @@ class ValueIteration(Module):
 
         # selecting the next action
 
-        if not self.soft_maxpool:
-            next_values = q_values.amax(dim = 1, keepdim = True)
-        else:
-            next_values = soft_maxpool(q_values,  temperature = self.soft_maxpool_temperature)
+        next_values = self.action_selector(q_values)
 
         return next_values
 
@@ -234,6 +259,7 @@ class ScalableVIN(Module):
         state_dim,
         reward_dim,
         num_actions,
+        num_plans = 1,
         dim_hidden = 150,
         init_kernel_size = 7,
         depth = 100,                    # they scaled this to 5000 in the paper to solve 100x100 maze
@@ -248,20 +274,27 @@ class ScalableVIN(Module):
     ):
         super().__init__()
         self.depth = depth
+        self.num_actions = num_actions
+        plan_actions = num_actions * num_plans
 
         self.reward_mapper = nn.Sequential(
             nn.Conv2d(state_dim + reward_dim, dim_hidden, 3, padding = 1),
             nn.Conv2d(dim_hidden, 1, 1, bias = False)
         )
 
-        self.to_init_value = nn.Conv2d(1, num_actions, 3, padding = 1, bias = False)
-        self.soft_maxpool = soft_maxpool
-        self.soft_maxpool_temperature = soft_maxpool_temperature
+        self.to_init_value = nn.Conv2d(1, plan_actions, 3, padding = 1, bias = False)
+
+        self.action_selector = ActionSelector(
+            num_plans = num_plans,
+            soft_maxpool = soft_maxpool,
+            soft_maxpool_temperature = soft_maxpool_temperature
+        )
 
         # value iteration network
 
         value_iteration_module = ValueIteration(
             num_actions,
+            num_plans = num_plans,
             soft_maxpool = soft_maxpool,
             soft_maxpool_temperature = soft_maxpool_temperature,
             **vi_module_kwargs
@@ -275,7 +308,7 @@ class ScalableVIN(Module):
 
         self.final_cropout_kernel_size = final_cropout_kernel_size
 
-        final_value_dim = final_cropout_kernel_size ** 2
+        final_value_dim = num_plans * final_cropout_kernel_size ** 2
         final_state_dim = state_dim * final_cropout_kernel_size ** 2
 
         # final attention across all values
@@ -316,12 +349,9 @@ class ScalableVIN(Module):
 
         q_values = self.to_init_value(reward)
 
-        if self.soft_maxpool:
-            value = soft_maxpool(q_values, temperature = self.soft_maxpool_temperature)
-        else:
-            value = q_values.amax(dim = 1, keepdim = True)
+        init_value = self.action_selector(q_values)
 
-        layer_values = self.planner(value, reward, depth = depth)
+        layer_values = self.planner(init_value, reward, depth = depth)
 
         # values across all layers
 
