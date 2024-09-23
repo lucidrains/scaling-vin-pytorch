@@ -1,4 +1,6 @@
 from functools import partial, wraps
+
+from beartype import beartype
 from typing import Literal
 
 import torch
@@ -416,6 +418,8 @@ class ValueIterationNetwork(Module):
 # main class
 
 class ScalableVIN(Module):
+
+    @beartype
     def __init__(
         self,
         state_dim,
