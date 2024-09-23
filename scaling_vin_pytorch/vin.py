@@ -1,4 +1,5 @@
 from functools import partial, wraps
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # w - width
 # d - depth of value iteration network
 # p - number of plans (different value maps transitioned on)
+# n - attention sequence length
 
 # helpers
 
@@ -245,6 +247,108 @@ class DynamicValueIteration(Module):
 
         return next_values
 
+class AttentionValueIteration(Module):
+    def __init__(
+        self,
+        action_channels,
+        *,
+        dim_qk = 8,
+        num_plans = 1,
+        receptive_field = 3,
+        pad_value = 0.,
+        soft_maxpool = False,
+        soft_maxpool_temperature = 1.,
+    ):
+        super().__init__()
+        assert is_odd(receptive_field)
+        padding = receptive_field // 2
+
+        self.action_channels = action_channels
+        plan_actions = num_plans * action_channels
+        self.num_plans = num_plans
+
+        # queries, keys, values
+
+        self.dim_qk = dim_qk
+
+        self.to_qk = nn.Conv2d(num_plans, 2 * num_plans * action_channels * dim_qk, 1, bias = False)
+        self.to_v = nn.Conv2d(num_plans, num_plans * action_channels, receptive_field, bias = False)
+
+        # padding related
+
+        self.kernel_size = receptive_field
+
+        self.pad_value = pad_value
+        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+        self.padding = padding
+
+        self.action_selector = ActionSelector(
+            num_plans = num_plans,
+            soft_maxpool = soft_maxpool,
+            soft_maxpool_temperature = soft_maxpool_temperature
+        )
+
+    def forward(
+        self,
+        values,
+        rewards
+    ):
+        kernel_size, pad = self.kernel_size, self.pad
+
+        rewards_and_values = values + rewards
+
+        width = rewards_and_values.shape[-1] # for rearranging back after unfold
+
+        # prepare queries, keys, values
+
+        q, k = self.to_qk(rewards_and_values).chunk(2, dim = 1)
+
+        # softmax the kernel for the values for stability
+
+        value_weights = self.to_v.weight
+
+        value_weights, inverse_pack = pack_one(value_weights, 'o i *')
+        value_weights = value_weights.softmax(dim = -1)
+        value_weights = inverse_pack(value_weights)
+
+        v = F.conv2d(pad(rewards_and_values), value_weights)
+
+        # unfold the keys and values
+
+        k, v = map(pad, (k, v))
+
+        k = F.unfold(k, kernel_size)
+        v = F.unfold(v, kernel_size)
+
+        seq_len = kernel_size ** 2
+
+        q, inverse_pack = pack_one(q, 'b a *')
+        k = rearrange(k, 'b (a n) hw -> b a n hw', n = seq_len)
+
+        # split out the hidden dimension for the queries and keys
+
+        q, k = map(lambda t: rearrange(t, 'b (a d) ... -> b a d ...', d = self.dim_qk), (q, k))
+
+        v = rearrange(v, 'b (a n) hw -> b a n hw', n = seq_len)
+
+        # perform attention
+
+        sim = einsum(q, k, 'b a d hw, b a d n hw -> b a hw n')
+
+        attn = sim.softmax(dim = -1)
+
+        q_values = einsum(attn, v, 'b a hw n, b a n hw -> b a hw')
+
+        # reshape height and width back
+
+        q_values = inverse_pack(q_values)
+
+        # selecting the next action
+
+        next_values = self.action_selector(q_values)
+
+        return next_values
+
 # value iteration network
 
 class ValueIterationNetwork(Module):
@@ -327,12 +431,15 @@ class ScalableVIN(Module):
         soft_maxpool_temperature = 1.,
         dynamic_transition = True,
         checkpoint = True,
+        vi_module_type: Literal['invariant', 'dynamic', 'attention'] = 'dynamic',
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict(),
         attn_dim_head = 64,
         attn_kwargs: dict = dict()
     ):
         super().__init__()
+        assert is_odd(init_kernel_size)
+
         self.depth = depth
         self.num_actions = num_actions
         self.num_plans = num_plans
@@ -354,7 +461,8 @@ class ScalableVIN(Module):
 
         # value iteration network
 
-        if dynamic_transition:
+        if vi_module_type == 'dynamic':
+
             value_iteration_module = DynamicValueIteration(
                 num_actions,
                 num_plans = num_plans,
@@ -362,7 +470,9 @@ class ScalableVIN(Module):
                 soft_maxpool_temperature = soft_maxpool_temperature,
                 **vi_module_kwargs
             )
-        else:
+
+        elif vi_module_type == 'invariant':
+
             value_iteration_module = ValueIteration(
                 num_actions,
                 num_plans = num_plans,
@@ -370,6 +480,19 @@ class ScalableVIN(Module):
                 soft_maxpool_temperature = soft_maxpool_temperature,
                 **vi_module_kwargs
             )
+
+        elif vi_module_type == 'attention':
+
+            value_iteration_module = AttentionValueIteration(
+                num_actions,
+                num_plans = num_plans,
+                soft_maxpool = soft_maxpool,
+                soft_maxpool_temperature = soft_maxpool_temperature,
+                **vi_module_kwargs
+            )
+
+        else:
+            raise ValueError(f'invalid value iteration module type {vi_module_type} given')
 
         # the value iteration network just calls the value iteration module recurrently
 
