@@ -273,7 +273,7 @@ class AttentionValueIteration(Module):
 
         self.dim_qk = dim_qk
 
-        self.to_qk = nn.Conv2d(num_plans, 2 * num_plans * action_channels * dim_qk, 1, bias = False)
+        self.to_qk = nn.Conv2d(num_plans, 2 * num_plans * action_channels * dim_qk, receptive_field, bias = False)
         self.to_v = nn.Conv2d(num_plans, num_plans * action_channels, receptive_field, bias = False)
 
         # padding related
@@ -303,7 +303,7 @@ class AttentionValueIteration(Module):
 
         # prepare queries, keys, values
 
-        q, k = self.to_qk(rewards_and_values).chunk(2, dim = 1)
+        q, k = self.to_qk(pad(rewards_and_values)).chunk(2, dim = 1)
 
         # softmax the kernel for the values for stability
 
