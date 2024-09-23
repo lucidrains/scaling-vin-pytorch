@@ -326,6 +326,7 @@ class ScalableVIN(Module):
         soft_maxpool = False,
         soft_maxpool_temperature = 1.,
         dynamic_transition = True,
+        checkpoint = True,
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict(),
         attn_dim_head = 64,
@@ -375,6 +376,7 @@ class ScalableVIN(Module):
         self.planner = ValueIterationNetwork(
             value_iteration_module,
             depth = depth,
+            checkpoint = checkpoint,
             **vin_kwargs
         )
 

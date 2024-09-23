@@ -4,14 +4,17 @@ import torch
 from scaling_vin_pytorch import ScalableVIN
 
 @pytest.mark.parametrize('dynamic_transition', (True, False))
+@pytest.mark.parametrize('checkpoint', (True, False))
 def test_scaling_vin(
-    dynamic_transition
+    dynamic_transition,
+    checkpoint
 ):
 
     scalable_vin = ScalableVIN(
         state_dim = 3,
         reward_dim = 2,
         num_actions = 10,
+        checkpoint = checkpoint,
         dynamic_transition = dynamic_transition
     )
 
