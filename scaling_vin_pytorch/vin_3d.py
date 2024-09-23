@@ -15,6 +15,8 @@ from x_transformers.x_transformers import RotaryEmbedding
 import einx
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
+from unfoldNd import unfoldNd
+
 # ein notation
 # b - batch
 # c - channels
@@ -23,6 +25,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 # a - actions (channels)
 # o - output (channels)
 # i - input (channels)
+# t - depth
 # h - height
 # w - width
 # d - depth of value iteration network
@@ -128,12 +131,12 @@ class ValueIteration(Module):
         plan_actions = num_plans * action_channels
         self.num_plans = num_plans
 
-        self.transition = nn.Conv2d(num_plans, action_channels * num_plans, receptive_field, padding = padding, bias = False)
+        self.transition = nn.Conv3d(num_plans, action_channels * num_plans, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
 
         self.pad_value = pad_value
-        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+        self.pad = partial(F.pad, pad = (padding,) * 6, value = pad_value)
 
         self.padding = padding
 
@@ -158,7 +161,7 @@ class ValueIteration(Module):
 
         # transition
 
-        q_values = F.conv2d(pad(rewards_and_values), transition_weight)
+        q_values = F.conv3d(pad(rewards_and_values), transition_weight)
 
         # selecting the next action
 
@@ -185,9 +188,9 @@ class DynamicValueIteration(Module):
         plan_actions = num_plans * action_channels
         self.num_plans = num_plans
 
-        self.transition = nn.Conv2d(
+        self.transition = nn.Conv3d(
             num_plans,
-            action_channels * (num_plans ** 2) * (receptive_field ** 2),
+            action_channels * (num_plans ** 2) * (receptive_field ** 3),
             receptive_field,
             padding = padding,
             bias = False
@@ -196,7 +199,7 @@ class DynamicValueIteration(Module):
         self.kernel_size = receptive_field
 
         self.pad_value = pad_value
-        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+        self.pad = partial(F.pad, pad = (padding,) * 6, value = pad_value)
 
         self.padding = padding
 
@@ -221,11 +224,11 @@ class DynamicValueIteration(Module):
 
         # dynamic transition kernel - in other words, first convolution outputs the transition kernel
 
-        dynamic_transitions = F.conv2d(pad(rewards_and_values), transition_weight)
+        dynamic_transitions = F.conv3d(pad(rewards_and_values), transition_weight)
 
         # reshape the output into the next transition weight kernel
 
-        dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, i = self.num_plans)
+        dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2 k3) t h w -> b o t h w (i k1 k2 k3)', k1 = self.kernel_size, k2 = self.kernel_size, k3 = self.kernel_size, i = self.num_plans)
 
         # the author then uses a softmax on the dynamic transition kernel
         # this actually becomes form of attention pooling seen in other papers
@@ -234,14 +237,14 @@ class DynamicValueIteration(Module):
 
         # unfold the reward and values to manually do "conv" with data dependent kernel
 
-        width = rewards_and_values.shape[-1] # for rearranging back after unfold
+        height, width = rewards_and_values.shape[-2:] # for rearranging back after unfold
 
-        unfolded_values = F.unfold(pad(rewards_and_values), self.kernel_size)
-        unfolded_values = rearrange(unfolded_values, 'b i (h w) -> b i h w', w = width)
+        unfolded_values = unfoldNd(pad(rewards_and_values), self.kernel_size)
+        unfolded_values = rearrange(unfolded_values, 'b i (t h w) -> b i t h w', w = width, h = height)
 
         # dynamic kernel
 
-        q_values = einsum(unfolded_values, dynamic_transitions, 'b i h w, b o h w i -> b o h w')
+        q_values = einsum(unfolded_values, dynamic_transitions, 'b i t h w, b o t h w i -> b o t h w')
 
         # selecting the next action
 
@@ -273,15 +276,15 @@ class AttentionValueIteration(Module):
 
         self.dim_qk = dim_qk
 
-        self.to_qk = nn.Conv2d(num_plans, 2 * num_plans * action_channels * dim_qk, receptive_field, bias = False)
-        self.to_v = nn.Conv2d(num_plans, num_plans * action_channels, receptive_field, bias = False)
+        self.to_qk = nn.Conv3d(num_plans, 2 * num_plans * action_channels * dim_qk, receptive_field, bias = False)
+        self.to_v = nn.Conv3d(num_plans, num_plans * action_channels, receptive_field, bias = False)
 
         # padding related
 
         self.kernel_size = receptive_field
 
         self.pad_value = pad_value
-        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+        self.pad = partial(F.pad, pad = (padding,) * 6, value = pad_value)
         self.padding = padding
 
         self.action_selector = ActionSelector(
@@ -313,33 +316,33 @@ class AttentionValueIteration(Module):
         value_weights = value_weights.softmax(dim = -1)
         value_weights = inverse_pack(value_weights)
 
-        v = F.conv2d(pad(rewards_and_values), value_weights)
+        v = F.conv3d(pad(rewards_and_values), value_weights)
 
         # unfold the keys and values
 
         k, v = map(pad, (k, v))
 
-        k = F.unfold(k, kernel_size)
-        v = F.unfold(v, kernel_size)
+        k = unfoldNd(k, kernel_size)
+        v = unfoldNd(v, kernel_size)
 
-        seq_len = kernel_size ** 2
+        seq_len = kernel_size ** 3
 
         q, inverse_pack = pack_one(q, 'b a *')
-        k = rearrange(k, 'b (a n) hw -> b a n hw', n = seq_len)
+        k = rearrange(k, 'b (a n) thw -> b a n thw', n = seq_len)
 
         # split out the hidden dimension for the queries and keys
 
         q, k = map(lambda t: rearrange(t, 'b (a d) ... -> b a d ...', d = self.dim_qk), (q, k))
 
-        v = rearrange(v, 'b (a n) hw -> b a n hw', n = seq_len)
+        v = rearrange(v, 'b (a n) thw -> b a n thw', n = seq_len)
 
         # perform attention
 
-        sim = einsum(q, k, 'b a d hw, b a d n hw -> b a hw n')
+        sim = einsum(q, k, 'b a d thw, b a d n thw -> b a thw n')
 
         attn = sim.softmax(dim = -1)
 
-        q_values = einsum(attn, v, 'b a hw n, b a n hw -> b a hw')
+        q_values = einsum(attn, v, 'b a thw n, b a n thw -> b a thw')
 
         # reshape height and width back
 
@@ -376,8 +379,8 @@ class ValueIterationNetwork(Module):
     ):
         depth = default(depth, self.depth)
 
-        values, _ = pack_one(values, 'b * h w')
-        rewards, _ = pack_one(rewards, 'b * h w')
+        values, _ = pack_one(values, 'b * t h w')
+        rewards, _ = pack_one(rewards, 'b * t h w')
 
         # checkpointable or not
 
@@ -451,11 +454,11 @@ class ScalableVIN(Module):
         plan_actions = num_actions * num_plans
 
         self.reward_mapper = nn.Sequential(
-            nn.Conv2d(state_dim + reward_dim, dim_hidden, 3, padding = 1),
-            nn.Conv2d(dim_hidden, 1, 1, bias = False)
+            nn.Conv3d(state_dim + reward_dim, dim_hidden, 3, padding = 1),
+            nn.Conv3d(dim_hidden, 1, 1, bias = False)
         )
 
-        self.to_init_value = nn.Conv2d(1, plan_actions, 3, padding = 1, bias = False)
+        self.to_init_value = nn.Conv3d(1, plan_actions, 3, padding = 1, bias = False)
 
         self.action_selector = ActionSelector(
             num_plans = num_plans,
@@ -509,8 +512,8 @@ class ScalableVIN(Module):
 
         self.final_cropout_kernel_size = final_cropout_kernel_size
 
-        final_value_dim = final_cropout_kernel_size ** 2
-        final_state_dim = state_dim * final_cropout_kernel_size ** 2
+        final_value_dim = final_cropout_kernel_size ** 3
+        final_state_dim = state_dim * final_cropout_kernel_size ** 3
 
         # final attention across all values
 
@@ -546,7 +549,7 @@ class ScalableVIN(Module):
 
         depth = default(depth, self.depth)
 
-        state_reward, _ = pack([state, reward], 'b * h w')
+        state_reward, _ = pack([state, reward], 'b * t h w')
 
         reward = self.reward_mapper(state_reward)
 
@@ -561,27 +564,27 @@ class ScalableVIN(Module):
         layer_values = torch.stack(layer_values)
         layer_values = torch.flip(layer_values, dims = (0,)) # so depth goes from last layer to first
 
-        layer_values, inverse_pack = pack_one(layer_values, '* c h w')  # pack the depth with the batch and calculate loss across all layers in one go
+        layer_values, inverse_pack = pack_one(layer_values, '* c t h w')  # pack the depth with the batch and calculate loss across all layers in one go
 
         # unfold the values across all layers, and select out the coordinate for the agent position
 
-        unfolded_layer_values = F.unfold(layer_values, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
+        unfolded_layer_values = unfoldNd(layer_values, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
 
-        unfolded_layer_values = inverse_pack(unfolded_layer_values, '* a hw')
+        unfolded_layer_values = inverse_pack(unfolded_layer_values, '* a thw')
 
         # get only the values at the agent coordinates
 
-        height_width_strides = tensor(state.stride()[-2:])
-        agent_position_hw_index = (agent_positions * height_width_strides).sum(dim = -1)
+        dimension_strides = tensor(state.stride()[-3:])
+        agent_position_index = (agent_positions * dimension_strides).sum(dim = -1)
 
-        unfolded_layer_values = einx.get_at('d b v [hw], b -> b d v', unfolded_layer_values, agent_position_hw_index)
+        unfolded_layer_values = einx.get_at('d b v [thw], b -> b d v', unfolded_layer_values, agent_position_index)
 
         unfolded_layer_values = rearrange(unfolded_layer_values, 'b d (p v) -> (b p) d v', p = num_plans)
 
         # concat states onto each value and do an attention across all values across all layers
 
-        unfolded_state_values = F.unfold(state, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
-        unfolded_state_values = einx.get_at('b s [hw], b -> b s', unfolded_state_values, agent_position_hw_index)
+        unfolded_state_values = unfoldNd(state, self.final_cropout_kernel_size, padding = self.final_cropout_kernel_size // 2)
+        unfolded_state_values = einx.get_at('b s [thw], b -> b s', unfolded_state_values, agent_position_index)
 
         unfolded_state_values = repeat(unfolded_state_values, 'b s -> (b p) d s', d = depth, p = num_plans)
 
