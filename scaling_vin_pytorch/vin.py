@@ -103,6 +103,8 @@ class ActionSelector(Module):
 
         return next_values
 
+# value iteration modules
+
 class ValueIteration(Module):
     def __init__(
         self,
@@ -113,7 +115,6 @@ class ValueIteration(Module):
         pad_value = 0.,
         soft_maxpool = False,
         soft_maxpool_temperature = 1.,
-        dynamic_transition_kernel = True,
     ):
         super().__init__()
         assert is_odd(receptive_field)
@@ -123,9 +124,7 @@ class ValueIteration(Module):
         plan_actions = num_plans * action_channels
         self.num_plans = num_plans
 
-        conv_out = action_channels * num_plans * (1 if not dynamic_transition_kernel else (num_plans * receptive_field ** 2))
-
-        self.transition = nn.Conv2d(num_plans, conv_out, receptive_field, padding = padding, bias = False)
+        self.transition = nn.Conv2d(num_plans, action_channels * num_plans, receptive_field, padding = padding, bias = False)
 
         self.kernel_size = receptive_field
 
@@ -140,7 +139,68 @@ class ValueIteration(Module):
             soft_maxpool_temperature = soft_maxpool_temperature
         )
 
-        self.dynamic_transition_kernel = dynamic_transition_kernel
+    def forward(
+        self,
+        values,
+        rewards
+    ):
+        pad = self.pad
+
+        rewards_and_values = values + rewards
+
+        # prepare for transition
+
+        transition_weight = self.transition.weight
+
+        # transition
+
+        q_values = F.conv2d(pad(rewards_and_values), transition_weight)
+
+        # selecting the next action
+
+        next_values = self.action_selector(q_values)
+
+        return next_values
+
+class DynamicValueIteration(Module):
+    def __init__(
+        self,
+        action_channels,
+        *,
+        num_plans = 1,
+        receptive_field = 3,
+        pad_value = 0.,
+        soft_maxpool = False,
+        soft_maxpool_temperature = 1.,
+    ):
+        super().__init__()
+        assert is_odd(receptive_field)
+        padding = receptive_field // 2
+
+        self.action_channels = action_channels
+        plan_actions = num_plans * action_channels
+        self.num_plans = num_plans
+
+        self.transition = nn.Conv2d(
+            num_plans,
+            action_channels * (num_plans ** 2) * (receptive_field ** 2),
+            receptive_field,
+            padding = padding,
+            bias = False
+        )
+
+        self.kernel_size = receptive_field
+
+        self.pad_value = pad_value
+        self.pad = partial(F.pad, pad = (padding,) * 4, value = pad_value)
+
+        self.padding = padding
+
+        self.action_selector = ActionSelector(
+            num_plans = num_plans,
+            soft_maxpool = soft_maxpool,
+            soft_maxpool_temperature = soft_maxpool_temperature
+        )
 
     def forward(
         self,
@@ -157,40 +217,35 @@ class ValueIteration(Module):
 
         # dynamic transition kernel - in other words, first convolution outputs the transition kernel
 
-        if self.dynamic_transition_kernel:
+        dynamic_transitions = F.conv2d(pad(rewards_and_values), transition_weight)
 
-            dynamic_transitions = F.conv2d(pad(rewards_and_values), transition_weight)
+        # reshape the output into the next transition weight kernel
 
-            # reshape the output into the next transition weight kernel
+        dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, i = self.num_plans)
 
-            dynamic_transitions = rearrange(dynamic_transitions, 'b (o i k1 k2) h w -> b o h w (i k1 k2)', k1 = self.kernel_size, k2 = self.kernel_size, i = self.num_plans)
+        # the author then uses a softmax on the dynamic transition kernel
+        # this actually becomes form of attention pooling seen in other papers
 
-            # the author then uses a softmax on the dynamic transition kernel
-            # this actually becomes form of attention pooling seen in other papers
+        dynamic_transitions = F.softmax(dynamic_transitions, dim = -1)
 
-            dynamic_transitions = F.softmax(dynamic_transitions, dim = -1)
+        # unfold the reward and values to manually do "conv" with data dependent kernel
 
-            # unfold the reward and values to manually do "conv" with data dependent kernel
+        width = rewards_and_values.shape[-1] # for rearranging back after unfold
 
-            width = rewards_and_values.shape[-1] # for rearranging back after unfold
+        unfolded_values = F.unfold(pad(rewards_and_values), self.kernel_size)
+        unfolded_values = rearrange(unfolded_values, 'b i (h w) -> b i h w', w = width)
 
-            unfolded_values = F.unfold(pad(rewards_and_values), self.kernel_size)
-            unfolded_values = rearrange(unfolded_values, 'b i (h w) -> b i h w', w = width)
+        # dynamic kernel
 
-            # dynamic kernel
-
-            q_values = einsum(unfolded_values, dynamic_transitions, 'b i h w, b o h w i -> b o h w')
-
-        else:
-            # transition
-
-            q_values = F.conv2d(pad(rewards_and_values), transition_weight)
+        q_values = einsum(unfolded_values, dynamic_transitions, 'b i h w, b o h w i -> b o h w')
 
         # selecting the next action
 
         next_values = self.action_selector(q_values)
 
         return next_values
+
+# value iteration network
 
 class ValueIterationNetwork(Module):
     def __init__(
@@ -270,7 +325,7 @@ class ScalableVIN(Module):
         final_cropout_kernel_size = 3,
         soft_maxpool = False,
         soft_maxpool_temperature = 1.,
-        dynamic_transition_kernel = True,
+        dynamic_transition = True,
         vi_module_kwargs: dict = dict(),
         vin_kwargs: dict = dict(),
         attn_dim_head = 64,
@@ -298,14 +353,24 @@ class ScalableVIN(Module):
 
         # value iteration network
 
-        value_iteration_module = ValueIteration(
-            num_actions,
-            num_plans = num_plans,
-            soft_maxpool = soft_maxpool,
-            soft_maxpool_temperature = soft_maxpool_temperature,
-            dynamic_transition_kernel = dynamic_transition_kernel,
-            **vi_module_kwargs
-        )
+        if dynamic_transition:
+            value_iteration_module = DynamicValueIteration(
+                num_actions,
+                num_plans = num_plans,
+                soft_maxpool = soft_maxpool,
+                soft_maxpool_temperature = soft_maxpool_temperature,
+                **vi_module_kwargs
+            )
+        else:
+            value_iteration_module = ValueIteration(
+                num_actions,
+                num_plans = num_plans,
+                soft_maxpool = soft_maxpool,
+                soft_maxpool_temperature = soft_maxpool_temperature,
+                **vi_module_kwargs
+            )
+
+        # the value iteration network just calls the value iteration module recurrently
 
         self.planner = ValueIterationNetwork(
             value_iteration_module,
